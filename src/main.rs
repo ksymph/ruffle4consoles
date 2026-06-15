@@ -325,12 +325,12 @@ pub fn main() {
     let mut menu_state = MenuState::new(BASE_PATH);
     let mut last_render = Instant::now();
     let mut player_state: Option<(Arc<Mutex<ruffle_core::Player>>, NullExecutor, Instant)> = None;
+    let mut start_held = false;
 
     'main: loop {
         if player_state.is_some() {
             // ============= PLAYING STATE =============
             let (player, mut executor, mut last_frame_time) = player_state.take().unwrap();
-            let mut start_held = false;
             let mut return_to_menu = false;
 
             #[cfg(target_os = "horizon")]
