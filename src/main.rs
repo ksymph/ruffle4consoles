@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ron::de::from_reader;
 use ron::from_str;
@@ -189,7 +189,11 @@ impl Default for Config {
 
 fn init_tracing() {
     let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::builder().parse_lossy("info,ruffle=info,avm_trace=info"))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,ruffle_core=info,ruffle_render_glow=info")
+            }),
+        )
         .with(tracing_subscriber::fmt::layer())
         .try_init();
 }
@@ -479,6 +483,8 @@ pub fn main() {
                             p.render();
                             sdl2_window.gl_swap_window();
                         }
+                    } else {
+                        tracing::error!("player lock poisoned — game has likely panicked");
                     }
                 }
                 player_state = Some((player, executor, last_frame_time));
@@ -613,7 +619,23 @@ fn launch_game(
         .with_log(ConsoleLogBackend::default())
         .build();
 
-    player.lock().unwrap().preload(&mut ExecutionLimit::none());
+    let preload_start = Instant::now();
+    let preload_timeout = Duration::from_secs(30);
+    loop {
+        let mut limit = ExecutionLimit::with_max_ops_and_time(100000, Duration::from_secs(10));
+        let done = player.lock().unwrap().preload(&mut limit);
+        let elapsed = preload_start.elapsed();
+        tracing::info!("preload running... {:?} elapsed", elapsed);
+        if done || elapsed >= preload_timeout {
+            if !done {
+                tracing::error!(
+                    "preload did not complete within {:?}, aborting",
+                    preload_timeout
+                );
+            }
+            break;
+        }
+    }
 
     Some((player, executor, Instant::now()))
 }
