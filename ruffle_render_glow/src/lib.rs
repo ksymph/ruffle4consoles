@@ -144,6 +144,12 @@ pub struct GlowRenderBackend {
     mult_color: Option<[f32; 4]>,
     add_color: Option<[f32; 4]>,
 
+    // Cache last-set texture parameters to avoid redundant GL state changes.
+    last_mag_filter: Option<i32>,
+    last_min_filter: Option<i32>,
+    last_wrap_s: Option<i32>,
+    last_wrap_t: Option<i32>,
+
     renderbuffer_width: i32,
     renderbuffer_height: i32,
     view_matrix: [[f32; 4]; 4],
@@ -258,6 +264,11 @@ impl GlowRenderBackend {
                 blend_modes: vec![],
                 mult_color: None,
                 add_color: None,
+
+                last_mag_filter: None,
+                last_min_filter: None,
+                last_wrap_s: None,
+                last_wrap_t: None,
 
                 viewport_scale_factor: 1.0,
             };
@@ -803,6 +814,11 @@ impl GlowRenderBackend {
             self.mult_color = None;
             self.add_color = None;
 
+            self.last_mag_filter = None;
+            self.last_min_filter = None;
+            self.last_wrap_s = None;
+            self.last_wrap_t = None;
+
             // Bind to MSAA render buffer if using MSAA.
             if let Some(msaa_buffers) = &self.msaa_buffers {
                 let gl = &self.gl;
@@ -999,6 +1015,36 @@ impl GlowRenderBackend {
                 COUNT
             };
             self.gl.draw_elements(MODE, count, glow::UNSIGNED_INT, 0);
+        }
+    }
+
+    fn set_texture_filter(&mut self, filter: i32) {
+        unsafe {
+            if self.last_mag_filter != Some(filter) {
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                self.last_mag_filter = Some(filter);
+            }
+            if self.last_min_filter != Some(filter) {
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                self.last_min_filter = Some(filter);
+            }
+        }
+    }
+
+    fn set_texture_wrap(&mut self, wrap: i32) {
+        unsafe {
+            if self.last_wrap_s != Some(wrap) {
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, wrap);
+                self.last_wrap_s = Some(wrap);
+            }
+            if self.last_wrap_t != Some(wrap) {
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, wrap);
+                self.last_wrap_t = Some(wrap);
+            }
         }
     }
 }
@@ -1383,14 +1429,17 @@ impl CommandHandler for GlowRenderBackend {
         unsafe {
             self.set_stencil_state();
             let entry = as_registry_data(&bitmap);
-            // Adjust the quad draw to use the target bitmap.
-            let quad = &self.bitmap_quad_draws;
-            let draw = &quad[0];
-            let bitmap_matrix = if let DrawType::Bitmap(BitmapDraw { matrix, .. }) = &draw.draw_type
-            {
-                matrix
-            } else {
-                unreachable!()
+
+            // Copy draw state eagerly so we can drop the borrow on self before
+            // calling self.set_texture_* (which needs &mut self).
+            let (vao, num_indices, bitmap_matrix) = {
+                let draw = &self.bitmap_quad_draws[0];
+                let matrix = if let DrawType::Bitmap(BitmapDraw { matrix, .. }) = &draw.draw_type {
+                    matrix.clone()
+                } else {
+                    unreachable!()
+                };
+                (draw.vao, draw.num_indices, matrix)
             };
 
             // Scale the quad to the bitmap's dimensions.
@@ -1413,13 +1462,11 @@ impl CommandHandler for GlowRenderBackend {
             let mult_color = transform.color_transform.mult_rgba_normalized();
             let add_color = transform.color_transform.add_rgba_normalized();
 
-            self.bind_vertex_array(Some(draw.vao));
+            self.bind_vertex_array(Some(vao));
 
             let program = &self.bitmap_program;
 
             // Set common render state, while minimizing unnecessary state changes.
-            // TODO: Using designated layout specifiers in WebGL2/OpenGL ES 3, we could guarantee that uniforms
-            // are in the same location between shaders, and avoid changing them unless necessary.
             if !std::ptr::eq(program, self.active_program) {
                 self.gl.use_program(Some(program.program));
                 self.active_program = program as *const ShaderProgram;
@@ -1440,33 +1487,26 @@ impl CommandHandler for GlowRenderBackend {
                 self.add_color = Some(add_color);
             }
 
-            program.uniform_matrix3fv(&self.gl, ShaderUniform::TextureMatrix, bitmap_matrix);
+            program.uniform_matrix3fv(&self.gl, ShaderUniform::TextureMatrix, &bitmap_matrix);
 
             // Bind texture.
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.bind_texture(glow::TEXTURE_2D, Some(entry.texture));
             program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
 
-            // Set texture parameters.
+            // Set texture parameters (cached to avoid redundant GL calls).
             let filter = if smoothing {
                 glow::LINEAR as i32
             } else {
                 glow::NEAREST as i32
             };
-            self.gl
-                .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
-            self.gl
-                .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+            self.set_texture_filter(filter);
 
-            let wrap = glow::CLAMP_TO_EDGE as i32;
-            self.gl
-                .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, wrap);
-            self.gl
-                .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, wrap);
+            self.set_texture_wrap(glow::CLAMP_TO_EDGE as i32);
 
             // Draw the triangles.
             self.gl
-                .draw_elements(glow::TRIANGLE_FAN, draw.num_indices, glow::UNSIGNED_INT, 0);
+                .draw_elements(glow::TRIANGLE_FAN, num_indices, glow::UNSIGNED_INT, 0);
         }
     }
 
@@ -1599,32 +1639,20 @@ impl CommandHandler for GlowRenderBackend {
                         self.gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
                         program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
 
-                        // Set texture parameters.
+                        // Set texture parameters (cached to avoid redundant GL calls).
                         let filter = if bitmap.is_smoothed {
                             glow::LINEAR as i32
                         } else {
                             glow::NEAREST as i32
                         };
-                        self.gl.tex_parameter_i32(
-                            glow::TEXTURE_2D,
-                            glow::TEXTURE_MAG_FILTER,
-                            filter,
-                        );
-                        self.gl.tex_parameter_i32(
-                            glow::TEXTURE_2D,
-                            glow::TEXTURE_MIN_FILTER,
-                            filter,
-                        );
-                        // On WebGL1, you are unable to change the wrapping parameter of non-power-of-2 textures.
+                        self.set_texture_filter(filter);
+
                         let wrap = if bitmap.is_repeating {
                             glow::REPEAT as i32
                         } else {
                             glow::CLAMP_TO_EDGE as i32
                         };
-                        self.gl
-                            .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, wrap);
-                        self.gl
-                            .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, wrap);
+                        self.set_texture_wrap(wrap);
                     }
                 }
 
