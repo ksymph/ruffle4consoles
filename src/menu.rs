@@ -1,12 +1,14 @@
+use std::fs::File;
 use std::path::Path;
 
 use glow::HasContext;
 
 use crate::bitmap_font::BitmapFont;
+use crate::config_menu::{ConfigAction, ConfigMenu};
+use crate::Config;
 
 const SWF_DIR: &str = "swf";
 const MAX_VISIBLE: usize = 26;
-const STUB_MSG: &str = "Config editing not yet implemented";
 
 pub enum MenuAction {
     Launch(String),
@@ -18,6 +20,8 @@ pub struct MenuState {
     pub selected: usize,
     pub scroll_offset: usize,
     stub_timer: Option<u128>,
+    base_path: String,
+    pub config_menu: Option<ConfigMenu>,
 }
 
 impl MenuState {
@@ -29,6 +33,8 @@ impl MenuState {
             selected: 0,
             scroll_offset: 0,
             stub_timer: None,
+            base_path: base_path.to_string(),
+            config_menu: None,
         }
     }
 
@@ -54,12 +60,37 @@ impl MenuState {
         self.selected = 0;
         self.scroll_offset = 0;
         self.stub_timer = None;
+        self.config_menu = None;
+        self.base_path = base_path.to_string();
+    }
+
+    fn load_config_for_menu(&self) -> Config {
+        let config_dir = format!("{}/config", self.base_path);
+        let config_file = format!("{}/{}.ron", config_dir, self.files[self.selected]);
+        match File::open(&config_file) {
+            Ok(f) => match ron::de::from_reader(f) {
+                Ok(c) => c,
+                Err(_) => Config::default(),
+            },
+            Err(_) => Config::default(),
+        }
     }
 
     pub fn handle_button(&mut self, is_down: bool, button: sdl2::controller::Button) -> Option<MenuAction> {
         if !is_down {
             return None;
         }
+
+        if let Some(cm) = &mut self.config_menu {
+            match cm.handle_button(is_down, button) {
+                Some(ConfigAction::BackToMenu) => {
+                    self.config_menu = None;
+                }
+                None => {}
+            }
+            return None;
+        }
+
         if self.stub_timer.is_some() {
             self.stub_timer = None;
             return None;
@@ -104,7 +135,9 @@ impl MenuState {
             }
             sdl2::controller::Button::Y => {
                 if !self.files.is_empty() {
-                    self.stub_timer = Some(0);
+                    let config = self.load_config_for_menu();
+                    let swf_name = self.files[self.selected].clone();
+                    self.config_menu = Some(ConfigMenu::new(swf_name, config, &self.base_path));
                 }
             }
             _ => {}
@@ -113,6 +146,10 @@ impl MenuState {
     }
 
     pub fn handle_axis_motion(&mut self, axis: sdl2::controller::Axis, value: i32) {
+        if let Some(cm) = &mut self.config_menu {
+            cm.handle_axis_motion(axis, value);
+            return;
+        }
         let deadzone = 16000;
         match axis {
             sdl2::controller::Axis::LeftY if value < -deadzone && !self.files.is_empty() => {
@@ -140,6 +177,9 @@ impl MenuState {
     }
 
     pub fn update_stub_timer(&mut self, dt_ms: u128) {
+        if self.config_menu.is_some() {
+            return;
+        }
         if let Some(t) = self.stub_timer.as_mut() {
             *t += dt_ms;
             if *t >= 2000 {
@@ -149,6 +189,10 @@ impl MenuState {
     }
 
     pub fn render(&self, gl: &glow::Context, font: &BitmapFont, screen_w: f32, screen_h: f32) {
+        if let Some(cm) = &self.config_menu {
+            cm.render(gl, font, screen_w, screen_h);
+            return;
+        }
         unsafe {
             gl.clear_color(0.08, 0.08, 0.12, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -195,31 +239,18 @@ impl MenuState {
                 }
             }
 
-            if let Some(_) = self.stub_timer {
-                let (sw, _) = font.measure(STUB_MSG);
-                font.render_text(
-                    gl,
-                    STUB_MSG,
-                    (screen_w - sw as f32) / 2.0,
-                    screen_h - 64.0,
-                    (1.0, 0.7, 0.2, 1.0),
-                    screen_w,
-                    screen_h,
-                );
-            }
-
-            if !self.files.is_empty() && self.stub_timer.is_none() {
+            if !self.files.is_empty() {
                 let bar_y = screen_h - 28.0;
                 font.render_text(
                     gl,
-                    "Cross: Launch Game",
+                    "Cross: Launch Game  |  Triangle: Edit Config",
                     12.0,
                     bar_y,
                     (0.6, 0.6, 0.8, 1.0),
                     screen_w,
                     screen_h,
                 );
-                let hint2 = "Triangle: Edit Config  |  Circle: Exit";
+                let hint2 = "Circle: Exit";
                 let (h2w, _) = font.measure(hint2);
                 font.render_text(
                     gl,

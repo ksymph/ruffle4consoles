@@ -3,6 +3,7 @@
 
 mod backends;
 mod bitmap_font;
+mod config_menu;
 mod font_data;
 mod menu;
 
@@ -27,7 +28,7 @@ use ruffle_render::quality::StageQuality;
 use ruffle_render_glow::GlowRenderBackend;
 
 use tracing_subscriber::layer::SubscriberExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sdl2::controller::Axis;
 
 use backends::log::ConsoleLogBackend;
@@ -171,10 +172,19 @@ Config(
 
 use tracing_subscriber::util::SubscriberInitExt;
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    gamepad_config: HashMap<String, u32>,
-    letterbox: Option<String>,
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Config {
+    pub gamepad_config: HashMap<String, u32>,
+    pub letterbox: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            gamepad_config: HashMap::new(),
+            letterbox: Some("on".to_string()),
+        }
+    }
 }
 
 fn init_tracing() {
