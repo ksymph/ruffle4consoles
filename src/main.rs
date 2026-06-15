@@ -330,6 +330,7 @@ pub fn main() {
         if player_state.is_some() {
             // ============= PLAYING STATE =============
             let (player, mut executor, mut last_frame_time) = player_state.take().unwrap();
+            let mut start_held = false;
             let mut return_to_menu = false;
 
             #[cfg(target_os = "horizon")]
@@ -367,7 +368,9 @@ pub fn main() {
                         }
                     }
                     sdl2::event::Event::ControllerButtonDown { button, .. } => {
-                        if button == sdl2::controller::Button::Back {
+                        if button == sdl2::controller::Button::Start {
+                            start_held = true;
+                        } else if button == sdl2::controller::Button::Back && start_held {
                             return_to_menu = true;
                             break;
                         }
@@ -382,6 +385,9 @@ pub fn main() {
                         }
                     }
                     sdl2::event::Event::ControllerButtonUp { button, .. } => {
+                        if button == sdl2::controller::Button::Start {
+                            start_held = false;
+                        }
                         let ruffle_button = sdl_gamepadbutton_to_ruffle(button);
                         if let Some(ruffle_button) = ruffle_button {
                             player
