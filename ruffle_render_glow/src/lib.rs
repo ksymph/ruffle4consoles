@@ -632,6 +632,7 @@ impl GlowRenderBackend {
                         draw_type: DrawType::Gradient(Box::new(Gradient::new(
                             lyon_mesh.gradients[gradient].clone(), // TODO: Gradient deduplication
                             matrix,
+                            self.gl.clone(),
                         ))),
                         vao,
                         vertex_buffer: Buffer {
@@ -1592,16 +1593,6 @@ impl CommandHandler for GlowRenderBackend {
                             ShaderUniform::GradientType,
                             gradient.gradient_type,
                         );
-                        program.uniform1fv(
-                            &self.gl,
-                            ShaderUniform::GradientRatios,
-                            &gradient.ratios,
-                        );
-                        program.uniform4fv(
-                            &self.gl,
-                            ShaderUniform::GradientColors,
-                            bytemuck::cast_slice(&gradient.colors),
-                        );
                         program.uniform1i(
                             &self.gl,
                             ShaderUniform::GradientRepeatMode,
@@ -1617,6 +1608,15 @@ impl CommandHandler for GlowRenderBackend {
                             ShaderUniform::GradientInterpolation,
                             (gradient.interpolation == swf::GradientInterpolation::LinearRgb)
                                 as i32,
+                        );
+
+                        self.gl.active_texture(glow::TEXTURE0);
+                        self.gl
+                            .bind_texture(glow::TEXTURE_2D, Some(gradient.texture));
+                        program.uniform1i(
+                            &self.gl,
+                            ShaderUniform::GradientTexture,
+                            0,
                         );
                     }
                     DrawType::Bitmap(bitmap) => {
@@ -1727,19 +1727,29 @@ impl CommandHandler for GlowRenderBackend {
     }
 }
 
-#[derive(Clone, Debug)]
+const GRADIENT_TEXTURE_SIZE: u32 = 256;
+
+#[derive(Debug)]
 struct Gradient {
     matrix: [[f32; 3]; 3],
     gradient_type: i32,
-    ratios: [f32; MAX_GRADIENT_COLORS],
-    colors: [[f32; 4]; MAX_GRADIENT_COLORS],
     repeat_mode: i32,
     focal_point: f32,
     interpolation: swf::GradientInterpolation,
+    gl: Arc<glow::Context>,
+    texture: glow::Texture,
+}
+
+impl Drop for Gradient {
+    fn drop(&mut self) {
+        unsafe {
+            self.gl.delete_texture(self.texture);
+        }
+    }
 }
 
 impl Gradient {
-    fn new(gradient: TessGradient, matrix: [[f32; 3]; 3]) -> Self {
+    fn new(gradient: TessGradient, matrix: [[f32; 3]; 3], gl: Arc<glow::Context>) -> Self {
         // TODO: Support more than MAX_GRADIENT_COLORS.
         let num_colors = gradient.records.len().min(MAX_GRADIENT_COLORS);
         let mut ratios = [0.0; MAX_GRADIENT_COLORS];
@@ -1752,7 +1762,6 @@ impl Gradient {
                 f32::from(record.color.b) / 255.0,
                 f32::from(record.color.a) / 255.0,
             ];
-            // Convert to linear color space if this is a linear-interpolated gradient.
             match gradient.interpolation {
                 swf::GradientInterpolation::Rgb => {}
                 swf::GradientInterpolation::LinearRgb => srgb_to_linear(&mut color),
@@ -1767,6 +1776,8 @@ impl Gradient {
             colors[i] = colors[i - 1];
         }
 
+        let texture = Self::make_texture(&gl, num_colors, &ratios, &colors);
+
         Self {
             matrix,
             gradient_type: match gradient.gradient_type {
@@ -1774,8 +1785,6 @@ impl Gradient {
                 GradientType::Radial => 1,
                 GradientType::Focal => 2,
             },
-            ratios,
-            colors,
             repeat_mode: match gradient.repeat_mode {
                 swf::GradientSpread::Pad => 0,
                 swf::GradientSpread::Repeat => 1,
@@ -1783,6 +1792,82 @@ impl Gradient {
             },
             focal_point: gradient.focal_point.to_f32().clamp(-0.98, 0.98),
             interpolation: gradient.interpolation,
+            gl,
+            texture,
+        }
+    }
+
+    fn make_texture(
+        gl: &glow::Context,
+        num_colors: usize,
+        ratios: &[f32; MAX_GRADIENT_COLORS],
+        colors: &[[f32; 4]; MAX_GRADIENT_COLORS],
+    ) -> glow::Texture {
+        let mut data = [0u8; GRADIENT_TEXTURE_SIZE as usize * 4];
+        let last = num_colors - 1;
+        for i in 0..GRADIENT_TEXTURE_SIZE as usize {
+            let t = (i as f32 + 0.5) / GRADIENT_TEXTURE_SIZE as f32;
+
+            let idx = if last > 0 {
+                let mut idx = 0;
+                while idx < last && t > ratios[idx + 1] {
+                    idx += 1;
+                }
+                idx
+            } else {
+                0
+            };
+
+            let r1 = ratios[idx];
+            let r2 = ratios[(idx + 1).min(last)];
+            let c1 = colors[idx];
+            let c2 = colors[(idx + 1).min(last)];
+
+            let a_lerp = if r2 > r1 {
+                ((t - r1) / (r2 - r1)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let r = (c1[0] + (c2[0] - c1[0]) * a_lerp) * 255.0;
+            let g = (c1[1] + (c2[1] - c1[1]) * a_lerp) * 255.0;
+            let b = (c1[2] + (c2[2] - c1[2]) * a_lerp) * 255.0;
+            let a_ch = (c1[3] + (c2[3] - c1[3]) * a_lerp) * 255.0;
+
+            data[i * 4] = r as u8;
+            data[i * 4 + 1] = g as u8;
+            data[i * 4 + 2] = b as u8;
+            data[i * 4 + 3] = a_ch as u8;
+        }
+
+        unsafe {
+            let texture = gl.create_texture().expect("Unable to create gradient texture");
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                GRADIENT_TEXTURE_SIZE as i32,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&data)),
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            texture
         }
     }
 }
@@ -1872,7 +1957,7 @@ struct ShaderProgram {
 }
 
 // These should match the uniform names in the shaders.
-const NUM_UNIFORMS: usize = 12;
+const NUM_UNIFORMS: usize = 11;
 const UNIFORM_NAMES: [&str; NUM_UNIFORMS] = [
     "world_matrix",
     "view_matrix",
@@ -1880,8 +1965,7 @@ const UNIFORM_NAMES: [&str; NUM_UNIFORMS] = [
     "add_color",
     "u_matrix",
     "u_gradient_type",
-    "u_ratios",
-    "u_colors",
+    "u_gradient_texture",
     "u_repeat_mode",
     "u_focal_point",
     "u_interpolation",
@@ -1895,8 +1979,7 @@ enum ShaderUniform {
     AddColor,
     TextureMatrix,
     GradientType,
-    GradientRatios,
-    GradientColors,
+    GradientTexture,
     GradientRepeatMode,
     GradientFocalPoint,
     GradientInterpolation,
@@ -1951,12 +2034,6 @@ impl ShaderProgram {
     fn uniform1f(&self, gl: &glow::Context, uniform: ShaderUniform, value: f32) {
         unsafe {
             gl.uniform_1_f32(self.uniforms[uniform as usize].as_ref(), value);
-        }
-    }
-
-    fn uniform1fv(&self, gl: &glow::Context, uniform: ShaderUniform, values: &[f32]) {
-        unsafe {
-            gl.uniform_1_f32_slice(self.uniforms[uniform as usize].as_ref(), values);
         }
     }
 
