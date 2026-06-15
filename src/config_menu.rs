@@ -13,8 +13,6 @@ const GAMEPAD_BUTTONS: &[(&str, &str)] = &[
     ("Triangle", "north"),
     ("L", "left-trigger"),
     ("R", "right-trigger"),
-    ("L2", "left-trigger-2"),
-    ("R2", "right-trigger-2"),
     ("Select", "select"),
     ("Start", "start"),
     ("DPad Up", "dpad-up"),
@@ -52,7 +50,7 @@ const KEYBOARD_KEYS: &[(&str, u32)] = &[
 
 const HEADER_INDEX: usize = 2;
 const GAMEPAD_START: usize = 3;
-const CONFIG_ITEM_COUNT: usize = 17;
+const CONFIG_ITEM_COUNT: usize = 15;
 const MAX_VISIBLE: usize = 26;
 
 fn key_display_name(code: u32) -> String {
