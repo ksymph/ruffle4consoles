@@ -49,7 +49,8 @@ debug = true
 inherits = "release"
 opt-level = 3
 strip = "none"
-lto = false
+debug = false
+lto = true
 panic = "abort"
 
 [profile.switch]
