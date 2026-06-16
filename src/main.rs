@@ -260,7 +260,7 @@ pub fn main() {
     #[cfg(target_os = "vita")]
     unsafe {
         vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
-        vglUseCachedMem(false);
+        vglUseCachedMem(true);
         vglUseTripleBuffering(false);
         vglSetParamBufferSize(1 * 1024 * 1024);
         vglInitWithCustomThreshold(
