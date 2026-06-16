@@ -36,7 +36,7 @@ use backends::log::ConsoleLogBackend;
 use backends::ui::SdlUiBackend;
 use backends::audio::SdlAudioBackend;
 use backends::storage::DiskStorageBackend;
-use diagnostics::{DiagnosticsState, check_gl_errors, log_heartbeat, log_memory_snapshot};
+use diagnostics::{DiagnosticsState, OperationTracker, check_gl_errors, log_heartbeat, log_memory_snapshot, spawn_watchdog};
 
 use glow::HasContext;
 use bitmap_font::BitmapFont;
@@ -333,6 +333,8 @@ pub fn main() {
     let mut last_render = Instant::now();
     let mut player_state: Option<(Arc<Mutex<ruffle_core::Player>>, NullExecutor, Instant, DiagnosticsState)> = None;
     let mut start_held = false;
+    let op_tracker = OperationTracker::new();
+    let _watchdog = spawn_watchdog(op_tracker.clone(), Duration::from_secs(2));
 
     tracing::info!("[DIAG] Main loop started, waiting for game selection");
 
@@ -347,30 +349,6 @@ pub fn main() {
                 log_memory_snapshot("first_frame");
             }
 
-            // Check for stuck tick/render (freeze detection)
-            if diag.tick_in_progress {
-                if let Some(start) = diag.tick_start {
-                    let stuck_time = start.elapsed();
-                    if stuck_time > Duration::from_secs(2) {
-                        tracing::error!(
-                            "[FREEZE DETECTED] tick() has been running for {:.1}s!",
-                            stuck_time.as_secs_f64()
-                        );
-                    }
-                }
-            }
-            if diag.render_in_progress {
-                if let Some(start) = diag.render_start {
-                    let stuck_time = start.elapsed();
-                    if stuck_time > Duration::from_secs(2) {
-                        tracing::error!(
-                            "[FREEZE DETECTED] render() has been running for {:.1}s!",
-                            stuck_time.as_secs_f64()
-                        );
-                    }
-                }
-            }
-
             #[cfg(target_os = "horizon")]
             {
                 let (nx_width, nx_height) = sdl2_window.drawable_size();
@@ -381,10 +359,11 @@ pub fn main() {
                 }
             }
 
+            diag.tracker.begin("events", diag.frame_count);
             for event in event_pump.poll_iter() {
                 match event {
                     sdl2::event::Event::Quit { .. } => {
-                        tracing::info!("[DIAG] Quit event received at frame {}", diag.frame_count);
+                        tracing::info!("[DIAG] Quit event at frame {}", diag.frame_count);
                         return_to_menu = true;
                         break;
                     }
@@ -410,7 +389,7 @@ pub fn main() {
                         if button == sdl2::controller::Button::Start {
                             start_held = true;
                         } else if button == sdl2::controller::Button::Back && start_held {
-                            tracing::info!("[DIAG] Start+Back pressed at frame {}, returning to menu", diag.frame_count);
+                            tracing::info!("[DIAG] Start+Back at frame {}", diag.frame_count);
                             return_to_menu = true;
                             break;
                         }
@@ -506,6 +485,7 @@ pub fn main() {
                     _ => {}
                 }
             }
+            diag.tracker.end();
 
             if !return_to_menu {
                 let new_time = Instant::now();
@@ -513,56 +493,73 @@ pub fn main() {
                 diag.last_dt = Duration::from_micros(dt as u64);
 
                 // Run executor (async tasks)
+                diag.tracker.begin("executor", diag.frame_count);
                 let exec_start = Instant::now();
                 executor.run();
                 diag.executor_time += exec_start.elapsed();
+                diag.tracker.end();
 
                 if dt > 0 {
                     last_frame_time = new_time;
+
+                    diag.tracker.begin("player_lock", diag.frame_count);
                     if let Ok(mut p) = player.lock() {
+                        diag.tracker.end();
+
                         // Tick
-                        diag.begin_tick();
+                        diag.tracker.begin("tick", diag.frame_count);
+                        let tick_start = Instant::now();
                         p.tick(dt as f64 / 1000.0);
-                        diag.end_tick();
+                        let tick_elapsed = tick_start.elapsed();
+                        diag.tracker.end();
+                        diag.last_tick_time = tick_elapsed;
+                        diag.tick_time += tick_elapsed;
                         diag.frame_count += 1;
 
-                        // Warn on slow ticks
-                        if diag.last_tick_time > Duration::from_millis(100) {
+                        if tick_elapsed > Duration::from_millis(100) {
                             tracing::warn!(
                                 "[DIAG] Slow tick at frame {}: {:.1}ms (dt={:.1}ms)",
                                 diag.frame_count,
-                                diag.last_tick_time.as_secs_f64() * 1000.0,
+                                tick_elapsed.as_secs_f64() * 1000.0,
                                 diag.last_dt.as_secs_f64() * 1000.0,
                             );
                         }
 
                         // Render
                         if p.needs_render() {
-                            diag.begin_render();
+                            diag.tracker.begin("render", diag.frame_count);
+                            let render_start = Instant::now();
                             p.render();
-                            diag.end_render();
+                            let render_elapsed = render_start.elapsed();
+                            diag.tracker.end();
+                            diag.last_render_time = render_elapsed;
+                            diag.render_time += render_elapsed;
+                            diag.render_count += 1;
+
+                            diag.tracker.begin("gl_swap", diag.frame_count);
                             check_gl_errors(&glow_context, "after render");
                             sdl2_window.gl_swap_window();
+                            diag.tracker.end();
 
-                            // Warn on slow renders
-                            if diag.last_render_time > Duration::from_millis(100) {
+                            if render_elapsed > Duration::from_millis(100) {
                                 tracing::warn!(
                                     "[DIAG] Slow render at frame {}: {:.1}ms",
                                     diag.frame_count,
-                                    diag.last_render_time.as_secs_f64() * 1000.0,
+                                    render_elapsed.as_secs_f64() * 1000.0,
                                 );
                             }
                         }
                     } else {
-                        tracing::error!("[DIAG] player lock poisoned — game has likely panicked");
+                        diag.tracker.end();
+                        tracing::error!("[DIAG] player lock poisoned");
                     }
                 } else {
-                    tracing::warn!("[DIAG] dt=0 at frame {}, skipping tick", diag.frame_count);
+                    tracing::warn!("[DIAG] dt=0 at frame {}", diag.frame_count);
                 }
 
                 // Heartbeat
                 if diag.should_heartbeat() {
-                    log_heartbeat(&diag, &glow_context);
+                    log_heartbeat(&diag);
                     diag.reset_heartbeat();
                 }
 
@@ -613,6 +610,7 @@ pub fn main() {
                                         gamepad_button_mapping,
                                         letterbox_config,
                                         dimensions,
+                                        op_tracker.clone(),
                                     );
                                     menu_state.refresh(BASE_PATH);
                                     last_render = Instant::now();
@@ -659,6 +657,7 @@ fn launch_game(
     gamepad_button_mapping: HashMap<GamepadButton, KeyCode>,
     letterbox_config: Letterbox,
     dimensions: ViewportDimensions,
+    op_tracker: OperationTracker,
 ) -> Option<(Arc<Mutex<ruffle_core::Player>>, NullExecutor, Instant, DiagnosticsState)> {
     let swf_url = format!("file:///{}/{}.swf", BASE_PATH, swf_name);
     let swf_path = format!("{}/swf/{}.swf", BASE_PATH, swf_name);
@@ -729,7 +728,7 @@ fn launch_game(
     }
 
     log_memory_snapshot("preload_done");
-    Some((player, executor, Instant::now(), DiagnosticsState::new()))
+    Some((player, executor, Instant::now(), DiagnosticsState::new_with_tracker(op_tracker)))
 }
 
 fn sdl_gamepadbutton_to_ruffle(button: sdl2::controller::Button) -> Option<GamepadButton> {

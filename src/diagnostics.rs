@@ -1,5 +1,67 @@
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use glow::HasContext;
+
+/// Tracks the current operation being performed by the main game loop.
+/// Read by the watchdog thread to determine where a freeze occurred.
+#[derive(Clone)]
+pub struct OperationTracker {
+    inner: Arc<Mutex<OperationState>>,
+}
+
+struct OperationState {
+    name: &'static str,
+    started: Instant,
+    frame_count: u64,
+}
+
+impl OperationTracker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(OperationState {
+                name: "init",
+                started: Instant::now(),
+                frame_count: 0,
+            })),
+        }
+    }
+
+    /// Mark the start of a named operation.
+    pub fn begin(&self, name: &'static str, frame: u64) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.name = name;
+            state.started = Instant::now();
+            state.frame_count = frame;
+        }
+    }
+
+    /// Mark the end of the current operation.
+    pub fn end(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.name = "idle";
+            state.frame_count = 0;
+        }
+    }
+
+    /// Check if the current operation has been running too long.
+    /// Returns (operation_name, duration, frame_count) if stuck.
+    pub fn check_stuck(&self, threshold: Duration) -> Option<(&'static str, Duration, u64)> {
+        if let Ok(state) = self.inner.lock() {
+            if state.name != "idle" {
+                let elapsed = state.started.elapsed();
+                if elapsed >= threshold {
+                    return Some((state.name, elapsed, state.frame_count));
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the current operation name.
+    pub fn current_operation(&self) -> &'static str {
+        self.inner.lock().map(|s| s.name).unwrap_or("unknown")
+    }
+}
 
 /// Tracks game loop health metrics for diagnosing freezes.
 pub struct DiagnosticsState {
@@ -29,18 +91,16 @@ pub struct DiagnosticsState {
     pub last_render_time: Duration,
     /// Last dt value passed to tick().
     pub last_dt: Duration,
-    /// Whether a tick is currently in progress (for freeze detection).
-    pub tick_in_progress: bool,
-    /// Whether a render is currently in progress.
-    pub render_in_progress: bool,
-    /// Timestamp when current tick started (if in_progress).
-    pub tick_start: Option<Instant>,
-    /// Timestamp when current render started (if in_progress).
-    pub render_start: Option<Instant>,
+    /// The operation tracker (shared with watchdog thread).
+    pub tracker: OperationTracker,
 }
 
 impl DiagnosticsState {
     pub fn new() -> Self {
+        Self::new_with_tracker(OperationTracker::new())
+    }
+
+    pub fn new_with_tracker(tracker: OperationTracker) -> Self {
         let now = Instant::now();
         DiagnosticsState {
             frame_count: 0,
@@ -56,10 +116,7 @@ impl DiagnosticsState {
             last_tick_time: Duration::ZERO,
             last_render_time: Duration::ZERO,
             last_dt: Duration::ZERO,
-            tick_in_progress: false,
-            render_in_progress: false,
-            tick_start: None,
-            render_start: None,
+            tracker,
         }
     }
 
@@ -91,37 +148,33 @@ impl DiagnosticsState {
     pub fn reset_memory_check(&mut self) {
         self.last_memory_check = Instant::now();
     }
+}
 
-    /// Mark tick as starting.
-    pub fn begin_tick(&mut self) {
-        self.tick_in_progress = true;
-        self.tick_start = Some(Instant::now());
-    }
-
-    /// Mark tick as finished, record duration.
-    pub fn end_tick(&mut self) {
-        if let Some(start) = self.tick_start.take() {
-            self.last_tick_time = start.elapsed();
-            self.tick_time += self.last_tick_time;
-        }
-        self.tick_in_progress = false;
-    }
-
-    /// Mark render as starting.
-    pub fn begin_render(&mut self) {
-        self.render_in_progress = true;
-        self.render_start = Some(Instant::now());
-    }
-
-    /// Mark render as finished, record duration.
-    pub fn end_render(&mut self) {
-        if let Some(start) = self.render_start.take() {
-            self.last_render_time = start.elapsed();
-            self.render_time += self.last_render_time;
-        }
-        self.render_in_progress = false;
-        self.render_count += 1;
-    }
+/// Spawns a watchdog thread that prints status every `interval`.
+/// If the main thread is stuck in an operation, it will log that.
+pub fn spawn_watchdog(tracker: OperationTracker, interval: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("watchdog".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                match tracker.check_stuck(Duration::from_secs(2)) {
+                    Some((op, elapsed, frame)) => {
+                        tracing::error!(
+                            "[WATCHDOG] Main thread STUCK in '{}' for {:.1}s (at frame {})",
+                            op,
+                            elapsed.as_secs_f64(),
+                            frame,
+                        );
+                    }
+                    None => {
+                        let op = tracker.current_operation();
+                        tracing::debug!("[WATCHDOG] main loop OK (op={})", op);
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn watchdog thread")
 }
 
 /// Queries free memory on PS Vita using sceKernelGetFreeMemorySize.
@@ -197,41 +250,25 @@ pub fn check_gl_errors(context: &glow::Context, label: &str) -> u32 {
 }
 
 /// Log a comprehensive heartbeat with all diagnostics.
-pub fn log_heartbeat(
-    state: &DiagnosticsState,
-    glow_context: &glow::Context,
-) {
+pub fn log_heartbeat(state: &DiagnosticsState) {
     let elapsed = state.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
 
-    // Memory
-    let mem_str = if let Some((kernel, user, cdram, phycont)) = get_vita_memory() {
-        format!(
-            " | MEM: user={} kernel={} cdram={} phycont={}",
-            format_bytes(user),
-            format_bytes(kernel),
-            format_bytes(cdram),
-            format_bytes(phycont)
-        )
-    } else {
-        String::new()
-    };
-
-    // GL errors
-    let gl_err = unsafe {
-        let mut count = 0u32;
-        loop {
-            let err = glow_context.get_error();
-            if err == glow::NO_ERROR {
-                break;
-            }
-            count += 1;
+    let mem_str = match get_vita_memory() {
+        Some((kernel, user, cdram, phycont)) => {
+            format!(
+                " | MEM: user={} kernel={} cdram={} phycont={}",
+                format_bytes(user),
+                format_bytes(kernel),
+                format_bytes(cdram),
+                format_bytes(phycont)
+            )
         }
-        count
+        None => " | MEM: unavailable".to_string(),
     };
 
     tracing::info!(
-        "[HEARTBEAT @ {:.1}s] frames={} | tick_total={:.1}ms render_total={:.1}ms (x{}) executor={:.1}ms{} | last_tick={:.1}ms last_render={:.1}ms last_dt={:.1}ms | pending_gl_err={}",
+        "[HEARTBEAT @ {:.1}s] frames={} | tick={:.1}ms render={:.1}ms(x{}) exec={:.1}ms{} | last_tick={:.1}ms last_render={:.1}ms dt={:.1}ms",
         elapsed_secs,
         state.frame_count,
         state.tick_time.as_secs_f64() * 1000.0,
@@ -242,20 +279,24 @@ pub fn log_heartbeat(
         state.last_tick_time.as_secs_f64() * 1000.0,
         state.last_render_time.as_secs_f64() * 1000.0,
         state.last_dt.as_secs_f64() * 1000.0,
-        gl_err,
     );
 }
 
 /// Log a detailed memory snapshot.
 pub fn log_memory_snapshot(label: &str) {
-    if let Some((kernel, user, cdram, phycont)) = get_vita_memory() {
-        tracing::info!(
-            "[MEMORY @ {}] user={} kernel={} cdram={} phycont={}",
-            label,
-            format_bytes(user),
-            format_bytes(kernel),
-            format_bytes(cdram),
-            format_bytes(phycont),
-        );
+    match get_vita_memory() {
+        Some((kernel, user, cdram, phycont)) => {
+            tracing::info!(
+                "[MEMORY @ {}] user={} kernel={} cdram={} phycont={}",
+                label,
+                format_bytes(user),
+                format_bytes(kernel),
+                format_bytes(cdram),
+                format_bytes(phycont),
+            );
+        }
+        None => {
+            tracing::warn!("[MEMORY @ {}] unavailable (sceKernelGetFreeMemorySize failed)", label);
+        }
     }
 }
