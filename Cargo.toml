@@ -30,7 +30,8 @@ chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 [target.armv7-sony-vita-newlibeabihf.dependencies]
 vitasdk-sys = { version = "0.3.2", features = [
     "SceLibKernel_stub",
-    "SceKernelThreadMgr_stub"
+    "SceKernelThreadMgr_stub",
+    "SceSysmem_stub"
 ] }
 
 [package.metadata.vita]
