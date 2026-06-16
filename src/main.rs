@@ -87,7 +87,7 @@ unsafe extern "C" {
 
 #[used]
 #[unsafe(export_name = "_newlib_heap_size_user")]
-pub static _NEWLIB_HEAP_SIZE_USER: u32 = 246 * 1024 * 1024;
+pub static _NEWLIB_HEAP_SIZE_USER: u32 = 128 * 1024 * 1024;
 
 #[cfg(target_os = "horizon")]
 unsafe extern "C" {
@@ -262,12 +262,12 @@ pub fn main() {
         vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
         vglUseCachedMem(false);
         vglUseTripleBuffering(false);
-        vglSetParamBufferSize(4 * 1024 * 1024);
+        vglSetParamBufferSize(1 * 1024 * 1024);
         vglInitWithCustomThreshold(
             0,
             960,
             544,
-            4 * 1024 * 1024,
+            1 * 1024 * 1024,
             0,
             0,
             0,
