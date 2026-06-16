@@ -25,7 +25,9 @@ use ruffle_render::tessellator::{
 use ruffle_render::transform::Transform;
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use swf::{BlendMode, Color, Twips};
 use thiserror::Error;
 
@@ -157,6 +159,10 @@ pub struct GlowRenderBackend {
     // This is currently unused - we just hold on to it
     // to expose via `get_viewport_dimensions`
     viewport_scale_factor: f64,
+
+    // Texture eviction LRU tracking
+    texture_lru: VecDeque<BitmapHandle>,
+    texture_budget: usize,
 }
 
 #[derive(Debug)]
@@ -164,13 +170,15 @@ struct RegistryData {
     gl: Arc<glow::Context>,
     width: u32,
     height: u32,
-    texture: glow::Texture,
+    texture: Mutex<Option<glow::Texture>>,
 }
 
 impl Drop for RegistryData {
     fn drop(&mut self) {
-        unsafe {
-            self.gl.delete_texture(self.texture);
+        if let Some(tex) = self.texture.lock().unwrap().take() {
+            unsafe {
+                self.gl.delete_texture(tex);
+            }
         }
     }
 }
@@ -271,6 +279,9 @@ impl GlowRenderBackend {
                 last_wrap_t: None,
 
                 viewport_scale_factor: 1.0,
+
+                texture_lru: VecDeque::new(),
+                texture_budget: 50,
             };
 
             renderer.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
@@ -936,6 +947,39 @@ impl GlowRenderBackend {
         }
     }
 
+    fn touch_texture_lru(&mut self, handle: &BitmapHandle) {
+        if let Some(pos) = self.texture_lru.iter().position(|h| {
+            let a = as_registry_data(h);
+            let b = as_registry_data(handle);
+            std::ptr::eq(a, b)
+        }) {
+            let entry = self.texture_lru.remove(pos).unwrap();
+            self.texture_lru.push_back(entry);
+        }
+    }
+
+    fn evict_texture_lru(&mut self) -> bool {
+        if let Some(handle) = self.texture_lru.pop_front() {
+            let data = as_registry_data(&handle);
+            let mut tex = data.texture.lock().unwrap();
+            if let Some(gl_tex) = tex.take() {
+                log::warn!("Evicting GL texture ({}x{})", data.width, data.height);
+                unsafe {
+                    self.gl.delete_texture(gl_tex);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn register_texture_lru(&mut self, handle: BitmapHandle) {
+        while self.texture_lru.len() >= self.texture_budget {
+            self.evict_texture_lru();
+        }
+        self.texture_lru.push_back(handle);
+    }
+
     fn push_blend_mode(&mut self, blend: RenderBlendMode) {
         if !same_blend_mode(self.blend_modes.last(), &blend) {
             self.apply_blend_mode(blend.clone());
@@ -1067,6 +1111,13 @@ impl RenderBackend for GlowRenderBackend {
     ) -> Option<Box<dyn SyncHandle>> {
         let entry = &as_registry_data(&handle);
 
+        let tex_guard = entry.texture.lock().unwrap();
+        let Some(texture) = *tex_guard else {
+            log::warn!("Skipping offscreen render for evicted texture");
+            return None;
+        };
+        drop(tex_guard);
+
         self.active_program = std::ptr::null();
         self.mask_state = MaskState::NoMask;
         self.num_masks = 0;
@@ -1082,7 +1133,7 @@ impl RenderBackend for GlowRenderBackend {
                 glow::FRAMEBUFFER,
                 glow::COLOR_ATTACHMENT0,
                 glow::TEXTURE_2D,
-                Some(entry.texture),
+                Some(texture),
                 0,
             );
 
@@ -1249,12 +1300,14 @@ impl RenderBackend for GlowRenderBackend {
                 glow::LINEAR as i32,
             );
 
-            Ok(BitmapHandle(Arc::new(RegistryData {
+            let handle = BitmapHandle(Arc::new(RegistryData {
                 gl: self.gl.clone(),
                 width: bitmap.width(),
                 height: bitmap.height(),
-                texture,
-            })))
+                texture: Mutex::new(Some(texture)),
+            }));
+            self.register_texture_lru(handle.clone());
+            Ok(handle)
         }
     }
 
@@ -1264,9 +1317,48 @@ impl RenderBackend for GlowRenderBackend {
         bitmap: Bitmap<'_>,
         mut region: PixelRegion,
     ) -> Result<(), BitmapError> {
-        unsafe {
-            let texture = as_registry_data(handle).texture;
+        let data = as_registry_data(handle);
 
+        let texture;
+        // Check if texture was evicted and recreate if needed.
+        {
+            let mut tex_guard = data.texture.lock().unwrap();
+            match *tex_guard {
+                Some(tex) => {
+                    texture = tex;
+                }
+                None => {
+                    let format = match bitmap.format() {
+                        BitmapFormat::Rgb | BitmapFormat::Yuv420p => glow::RGB,
+                        BitmapFormat::Rgba | BitmapFormat::Yuva420p => glow::RGBA,
+                    };
+                    unsafe {
+                        let new_tex = self.gl.create_texture().expect("Unable to recreate texture");
+                        self.gl.bind_texture(glow::TEXTURE_2D, Some(new_tex));
+                        self.gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            format as i32,
+                            bitmap.width() as i32,
+                            bitmap.height() as i32,
+                            0,
+                            format,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(bitmap.data())),
+                        );
+                        self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                        self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                        self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                        self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                        *tex_guard = Some(new_tex);
+                        texture = new_tex;
+                    }
+                    log::info!("Recreated evicted texture ({}x{})", bitmap.width(), bitmap.height());
+                }
+            }
+        }
+
+        unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
 
             let (format, mut bitmap) = match bitmap.format() {
@@ -1330,6 +1422,13 @@ impl RenderBackend for GlowRenderBackend {
         let handle = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle).unwrap();
 
         let entry = &as_registry_data(&handle.texture);
+        let tex_guard = entry.texture.lock().unwrap();
+        let Some(texture) = *tex_guard else {
+            log::warn!("Skipping sync handle resolution for evicted texture");
+            return Ok(());
+        };
+        drop(tex_guard);
+
         unsafe {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, Some(self.offscreen_framebuffer));
@@ -1338,7 +1437,7 @@ impl RenderBackend for GlowRenderBackend {
                 glow::FRAMEBUFFER,
                 glow::COLOR_ATTACHMENT0,
                 glow::TEXTURE_2D,
-                Some(entry.texture),
+                Some(texture),
                 0,
             );
 
@@ -1409,12 +1508,14 @@ impl RenderBackend for GlowRenderBackend {
                 glow::LINEAR as i32,
             );
 
-            Ok(BitmapHandle(Arc::new(RegistryData {
+            let handle = BitmapHandle(Arc::new(RegistryData {
                 gl: self.gl.clone(),
                 width,
                 height,
-                texture,
-            })))
+                texture: Mutex::new(Some(texture)),
+            }));
+            self.register_texture_lru(handle.clone());
+            Ok(handle)
         }
     }
 }
@@ -1491,9 +1592,18 @@ impl CommandHandler for GlowRenderBackend {
             program.uniform_matrix3fv(&self.gl, ShaderUniform::TextureMatrix, &bitmap_matrix);
 
             // Bind texture.
+            let tex_guard = entry.texture.lock().unwrap();
+            let Some(texture) = *tex_guard else {
+                log::warn!("Skipping render of evicted bitmap texture");
+                return;
+            };
+            drop(tex_guard);
             self.gl.active_texture(glow::TEXTURE0);
-            self.gl.bind_texture(glow::TEXTURE_2D, Some(entry.texture));
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
+
+            // Update LRU position for this texture
+            self.touch_texture_lru(&bitmap);
 
             // Set texture parameters (cached to avoid redundant GL calls).
             let filter = if smoothing {
@@ -1621,7 +1731,17 @@ impl CommandHandler for GlowRenderBackend {
                     }
                     DrawType::Bitmap(bitmap) => {
                         let texture = match &bitmap.handle {
-                            Some(handle) => &as_registry_data(handle).texture,
+                            Some(handle) => {
+                                let data = as_registry_data(handle);
+                                let tex_guard = data.texture.lock().unwrap();
+                                match *tex_guard {
+                                    Some(tex) => tex,
+                                    None => {
+                                        log::warn!("Skipping render of evicted bitmap in shape");
+                                        continue;
+                                    }
+                                }
+                            }
                             None => {
                                 log::warn!("Tried to render a handleless bitmap");
                                 continue;
@@ -1636,8 +1756,13 @@ impl CommandHandler for GlowRenderBackend {
 
                         // Bind texture.
                         self.gl.active_texture(glow::TEXTURE0);
-                        self.gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+                        self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                         program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
+
+                        // Update LRU position for this texture
+                        if let Some(handle) = &bitmap.handle {
+                            self.touch_texture_lru(handle);
+                        }
 
                         // Set texture parameters (cached to avoid redundant GL calls).
                         let filter = if bitmap.is_smoothed {
