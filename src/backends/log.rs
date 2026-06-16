@@ -11,11 +11,10 @@ impl Default for ConsoleLogBackend {
 
 impl LogBackend for ConsoleLogBackend {
     fn avm_trace(&self, message: &str) {
-        println!("{}", message);
+        tracing::info!(target: "avm_trace", "[AVM] {}", message);
     }
 
     fn avm_warning(&self, message: &str) {
-        // Match the format used by Flash Player
-        println!("Warning: {}", message);
+        tracing::warn!(target: "avm_trace", "[AVM Warning] {}", message);
     }
 }
