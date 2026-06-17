@@ -87,7 +87,7 @@ unsafe extern "C" {
 
 #[used]
 #[unsafe(export_name = "_newlib_heap_size_user")]
-pub static _NEWLIB_HEAP_SIZE_USER: u32 = 200 * 1024 * 1024;
+pub static _NEWLIB_HEAP_SIZE_USER: u32 = 180 * 1024 * 1024;
 
 #[cfg(target_os = "horizon")]
 unsafe extern "C" {
@@ -710,7 +710,7 @@ fn launch_game(
     let preload_timeout = Duration::from_secs(30);
     log_memory_snapshot("game_launch");
     loop {
-        let mut limit = ExecutionLimit::with_max_ops_and_time(100000, Duration::from_secs(10));
+        let mut limit = ExecutionLimit::with_max_ops_and_time(100000, Duration::from_secs(30));
         let done = player.lock().unwrap().preload(&mut limit);
         let elapsed = preload_start.elapsed();
         tracing::info!("preload running... {:?} elapsed", elapsed);
