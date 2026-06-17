@@ -38,7 +38,7 @@ use backends::audio::SdlAudioBackend;
 use backends::storage::DiskStorageBackend;
 use diagnostics::{DiagnosticsState, OperationTracker, check_gl_errors, log_heartbeat, log_memory_snapshot, spawn_watchdog};
 
-use glow::HasContext;
+use glow::HasContext as _;
 use bitmap_font::BitmapFont;
 use menu::{MenuAction, MenuState};
 
@@ -260,7 +260,7 @@ pub fn main() {
     #[cfg(target_os = "vita")]
     unsafe {
         vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
-        vglUseCachedMem(false);
+        vglUseCachedMem(true);
         vglUseTripleBuffering(false);
         vglSetParamBufferSize(1 * 1024 * 1024);
         vglInitWithCustomThreshold(
@@ -712,6 +712,9 @@ fn launch_game(
     loop {
         let mut limit = ExecutionLimit::none();
         let done = player.lock().unwrap().preload(&mut limit);
+        unsafe {
+            glow_context.finish();
+        }
         let elapsed = preload_start.elapsed();
         tracing::info!("preload running... {:?} elapsed", elapsed);
         if done || elapsed >= preload_timeout {
