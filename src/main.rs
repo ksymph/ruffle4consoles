@@ -704,7 +704,6 @@ fn launch_game(
         .with_gamepad_button_mapping(gamepad_button_mapping)
         .with_autoplay(true)
         .with_log(ConsoleLogBackend::default())
-        .with_max_execution_duration(Duration::from_secs(5))
         .build();
 
     let preload_start = Instant::now();

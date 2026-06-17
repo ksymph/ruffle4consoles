@@ -281,7 +281,7 @@ impl GlowRenderBackend {
                 viewport_scale_factor: 1.0,
 
                 texture_lru: VecDeque::new(),
-                texture_budget: 50,
+                texture_budget: 20,
             };
 
             renderer.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
@@ -958,7 +958,7 @@ impl GlowRenderBackend {
         }
     }
 
-    fn evict_texture_lru(&mut self) -> bool {
+    fn evict_one_texture(&mut self) -> bool {
         if let Some(handle) = self.texture_lru.pop_front() {
             let data = as_registry_data(&handle);
             let mut tex = data.texture.lock().unwrap();
@@ -973,10 +973,16 @@ impl GlowRenderBackend {
         false
     }
 
-    fn register_texture_lru(&mut self, handle: BitmapHandle) {
-        while self.texture_lru.len() >= self.texture_budget {
-            self.evict_texture_lru();
+    /// Evict one LRU texture and force GPU to process the deletion
+    /// so physical pages are freed before the next allocation.
+    fn evict_one_and_finish(&mut self) {
+        self.evict_one_texture();
+        unsafe {
+            self.gl.finish();
         }
+    }
+
+    fn register_texture_lru(&mut self, handle: BitmapHandle) {
         self.texture_lru.push_back(handle);
     }
 
@@ -1258,13 +1264,19 @@ impl RenderBackend for GlowRenderBackend {
     }
 
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
+        // Evict one texture before allocating, to ensure free GPU pages
+        if self.texture_lru.len() >= self.texture_budget {
+            self.evict_one_and_finish();
+        }
+
         unsafe {
             let (format, mut bitmap) = match bitmap.format() {
                 BitmapFormat::Rgb | BitmapFormat::Yuv420p => (glow::RGB, bitmap.to_rgb()),
                 BitmapFormat::Rgba | BitmapFormat::Yuva420p => (glow::RGBA, bitmap.to_rgba()),
             };
             self.clamp_bitmap(&mut bitmap, format);
-            let texture = self.gl.create_texture().expect("Unable to create texture");
+            let texture = self.gl.create_texture()
+                .map_err(|_| BitmapError::Unimplemented("Unable to create texture".into()))?;
             self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             self.gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -1482,8 +1494,14 @@ impl RenderBackend for GlowRenderBackend {
         width: u32,
         height: u32,
     ) -> Result<BitmapHandle, BitmapError> {
+        // Evict one texture before allocating, to ensure free GPU pages
+        if self.texture_lru.len() >= self.texture_budget {
+            self.evict_one_and_finish();
+        }
+
         unsafe {
-            let texture = self.gl.create_texture().unwrap();
+            let texture = self.gl.create_texture()
+                .map_err(|_| BitmapError::Unimplemented("Unable to create texture".into()))?;
             self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
 
             // You must set the texture parameters for non-power-of-2 textures to function in WebGL1.
