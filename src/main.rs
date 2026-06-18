@@ -87,7 +87,7 @@ unsafe extern "C" {
 
 #[used]
 #[unsafe(export_name = "_newlib_heap_size_user")]
-pub static _NEWLIB_HEAP_SIZE_USER: u32 = 160 * 1024 * 1024;
+pub static _NEWLIB_HEAP_SIZE_USER: u32 = 48 * 1024 * 1024;
 
 #[cfg(target_os = "horizon")]
 unsafe extern "C" {
@@ -671,7 +671,10 @@ fn launch_game(
     };
 
     let movie = match SwfMovie::from_data(&swf_data, swf_url.into(), None) {
-        Ok(m) => m,
+        Ok(m) => {
+            drop(swf_data);
+            m
+        }
         Err(e) => {
             println!("Couldn't parse {}: {}", swf_path, e);
             return None;
