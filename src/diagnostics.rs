@@ -183,7 +183,7 @@ pub fn spawn_watchdog(tracker: OperationTracker, interval: Duration) -> std::thr
 pub fn get_vita_memory() -> Option<(usize, usize, usize, usize)> {
     unsafe {
         let mut info = vitasdk_sys::SceKernelFreeMemorySizeInfo {
-            size: 0,
+            size: std::mem::size_of::<vitasdk_sys::SceKernelFreeMemorySizeInfo>() as i32,
             size_user: 0,
             size_cdram: 0,
             size_phycont: 0,

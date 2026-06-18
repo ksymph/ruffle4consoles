@@ -26,6 +26,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-log = "0.2.0"
 url = "2.5.7"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+jpeg-decoder = { version = "0.3.2", default-features = false, features = ["force_immediate"] }
 
 [target.armv7-sony-vita-newlibeabihf.dependencies]
 vitasdk-sys = { version = "0.3.2", features = [
@@ -60,3 +61,6 @@ opt-level = 3
 strip = "none"
 lto = true
 panic = "abort"
+
+[patch.crates-io]
+jpeg-decoder = { path = "lib/jpeg-decoder" }

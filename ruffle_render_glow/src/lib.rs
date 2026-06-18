@@ -281,7 +281,7 @@ impl GlowRenderBackend {
                 viewport_scale_factor: 1.0,
 
                 texture_lru: VecDeque::new(),
-                texture_budget: 20,
+                texture_budget: 500,
             };
 
             renderer.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
