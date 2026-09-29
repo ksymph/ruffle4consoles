@@ -234,7 +234,22 @@ fn load_config_for_swf(
     (gamepad_button_mapping, letterbox)
 }
 
+#[cfg(not(target_os = "vita"))]
 pub fn main() {
+    main_func();
+}
+
+#[cfg(target_os = "vita")]
+pub fn main() {
+    std::thread::Builder::new()
+        .stack_size(1 * 1024 * 1024)
+        .spawn(main_func)
+        .expect("Unable to spawn thread")
+        .join()
+        .expect("Unable to join thread");
+}
+
+pub fn main_func() {
     unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
     init_tracing();
 
@@ -243,7 +258,7 @@ pub fn main() {
         unsafe {
             let id = vitasdk_sys::sceKernelGetThreadId();
             vitasdk_sys::sceKernelChangeThreadPriority(id, vitasdk_sys::SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH as _);
-            vitasdk_sys::sceKernelChangeThreadCpuAffinityMask(id, vitasdk_sys::SCE_KERNEL_CPU_MASK_USER_0 as _);
+            vitasdk_sys::sceKernelChangeThreadCpuAffinityMask(id, vitasdk_sys::SCE_KERNEL_CPU_MASK_USER_1 as _);
         }
     }
 
@@ -599,16 +614,19 @@ fn launch_game(
     let _ = std::fs::create_dir_all(storage_path.clone());
     let executor = NullExecutor::new();
 
+    #[cfg(not(target_os = "vita"))]
+    let executor_base_path = std::path::Path::new(BASE_PATH);
+    #[cfg(target_os = "vita")]
+    let executor_base_path = std::path::Path::new("/"); // Just use app0
+
     let player = PlayerBuilder::new()
         .with_renderer(renderer)
+        .with_audio(audio)
         .with_ui(ui_backend)
         .with_storage(Box::new(DiskStorageBackend::new(std::path::PathBuf::from(
             storage_path,
         ))))
-        .with_navigator(
-            NullNavigatorBackend::with_base_path(std::path::Path::new(BASE_PATH), &executor)
-                .unwrap(),
-        )
+        .with_navigator(NullNavigatorBackend::with_base_path(executor_base_path, &executor).unwrap())
         .with_movie(movie)
         .with_viewport_dimensions(dimensions.width, dimensions.height, dimensions.scale_factor)
         .with_fullscreen(true)

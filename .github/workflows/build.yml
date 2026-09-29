@@ -18,7 +18,17 @@ jobs:
                 cmake -S. -Bbuild -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DVIDEO_VITA_VGL=ON -G Ninja
                 cmake --build build --parallel $(nproc)
                 cmake --install build
-
+                
+            - name: Install vitaGL
+              run: |
+                git clone --depth=1 https://github.com/Rinnegatamante/vitaShaRK
+                cd vitaShaRK 
+                make install -j$(nproc)
+                cd ..
+                git clone --depth=1 https://github.com/Rinnegatamante/vitaGL
+                cd vitaGL
+                make PRIMITIVES_SPEEDHACK=0 USE_SCRATCH_MEMORY=1 HAVE_CUSTOM_HEAP=1 HAVE_PTHREAD=1 LOG_ERRORS=1 install -j$(nproc)
+     
             - name: Build
               run: ./build_psp2.sh
 
@@ -26,6 +36,11 @@ jobs:
               with:
                 name: vita
                 path: target/armv7-sony-vita-newlibeabihf/vita/ruffle4consoles.vpk
+
+            - uses: actions/upload-artifact@v7
+              with:
+                name: vita-self
+                path: target/armv7-sony-vita-newlibeabihf/vita/ruffle4consoles.self
 
     build-nx:
         name: Nintendo Switch
