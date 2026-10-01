@@ -40,7 +40,7 @@ assets = "./static/vita"
 build_std = "std,panic_abort"
 
 [package.metadata.vita.profile.vita]
-strip_symbols = true
+strip_symbols = false
 
 [profile.release]
 debug = true
@@ -49,7 +49,7 @@ debug = true
 inherits = "release"
 opt-level = 3
 strip = "none"
-debug = false
+debug = "line-tables-only"
 lto = true
 panic = "abort"
 

@@ -1105,7 +1105,12 @@ impl RenderBackend for GlowRenderBackend {
             self.set_stencil_state();
             // TODO: clearColor() based on alpha/transparency
             self.gl.stencil_mask(0xff);
-            self.gl.clear(glow::STENCIL_BUFFER_BIT); // is this needed?
+            // NOTE: do not clear the stencil buffer here. The offscreen
+            // framebuffer has only a color attachment, so vitaGL gives it a
+            // depth-only surface with no stencil plane; calling
+            // glClear(GL_STENCIL_BUFFER_BIT) on it faults inside SceGxm.
+            // Offscreen passes do not use stencil masks, and the default
+            // framebuffer's stencil is cleared in begin_frame().
 
             commands.execute(self);
 
@@ -1123,13 +1128,12 @@ impl RenderBackend for GlowRenderBackend {
                 [-1.0, 1.0, 0.0, 1.0],
             ];
 
-            self.gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                None,
-                0,
-            );
+            // NOTE: intentionally do not detach the color texture. vitaGL
+            // marks the framebuffer's GXM render target dirty and frees it
+            // asynchronously when a texture is detached; doing that on every
+            // offscreen pass allocates render targets faster than the GC
+            // reclaims them, exhausting GPU memory. Leaving the texture
+            // attached lets vitaGL reuse the render target.
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
         Some(Box::new(QueueSyncHandle {
@@ -1330,6 +1334,16 @@ impl RenderBackend for GlowRenderBackend {
         let handle = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle).unwrap();
 
         let entry = &as_registry_data(&handle.texture);
+        // `copy_pixels_to_bitmapdata` expects a tightly packed buffer that
+        // contains only the requested region, indexed from (0, 0). Read exactly
+        // `bounds`; previously the whole texture was allocated and x_max/y_max
+        // were passed as the read width/height, producing a wrong buffer and a
+        // large over-allocation.
+        let region = handle.bounds;
+        let region_w = region.width() as usize;
+        let region_h = region.height() as usize;
+        let row_bytes = region_w * 4;
+        let sz = row_bytes * region_h;
         unsafe {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, Some(self.offscreen_framebuffer));
@@ -1342,28 +1356,21 @@ impl RenderBackend for GlowRenderBackend {
                 0,
             );
 
-            let sz = ((entry.width * entry.height) as usize) * 4;
             let mut pixels: Vec<u8> = vec![0; sz]; // TODO uninitialized?
             self.gl.read_pixels(
-                handle.bounds.x_min as i32,
-                handle.bounds.y_min as i32,
-                handle.bounds.x_max as i32,
-                handle.bounds.y_max as i32,
+                region.x_min as i32,
+                region.y_min as i32,
+                region_w as i32,
+                region_h as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
                 PixelPackData::Slice(Some(&mut pixels)),
             ); // TODO `?`;
 
-            self.gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                None,
-                0,
-            );
-
+            // As in render_offscreen, leave the texture attached so vitaGL can
+            // reuse the GXM render target instead of reallocating it each time.
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            with_rgba(&pixels, entry.width * 4);
+            with_rgba(&pixels, row_bytes as u32);
         }
 
         Ok(())
